@@ -134,3 +134,12 @@ data/__pycache__/
 models/__pycache__/
 runs/
 dataset/
+
+# --- MIMO-UNet 訓練結果與權重 ---
+results/
+weights/
+*.pkl
+*.pth
+
+# --- W&B 與 TensorBoard 訓練日誌 ---
+wandb/

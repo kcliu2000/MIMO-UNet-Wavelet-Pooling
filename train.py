@@ -6,9 +6,13 @@ from utils import Adder, Timer, check_lr
 from torch.utils.tensorboard import SummaryWriter
 from valid import _valid
 import torch.nn.functional as F
+import wandb
 
 
 def _train(model, args):
+
+
+    wandb.init(project="MIMO-UNet-Wavelet", name="MIMO-UNet_True_Wavelet", config=vars(args))   
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     criterion = torch.nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(),
@@ -31,6 +35,7 @@ def _train(model, args):
     writer = SummaryWriter()
     epoch_pixel_adder = Adder()
     epoch_fft_adder = Adder()
+    epoch_wvl_adder = Adder()
     iter_pixel_adder = Adder()
     iter_fft_adder = Adder()
     epoch_timer = Timer('m')
@@ -56,33 +61,78 @@ def _train(model, args):
             l3 = criterion(pred_img[2], label_img)
             loss_content = l1+l2+l3
 
+            '''2026/3/11
             label_fft1 = torch.rfft(label_img4, signal_ndim=2, normalized=False, onesided=False)
             pred_fft1 = torch.rfft(pred_img[0], signal_ndim=2, normalized=False, onesided=False)
             label_fft2 = torch.rfft(label_img2, signal_ndim=2, normalized=False, onesided=False)
             pred_fft2 = torch.rfft(pred_img[1], signal_ndim=2, normalized=False, onesided=False)
             label_fft3 = torch.rfft(label_img, signal_ndim=2, normalized=False, onesided=False)
             pred_fft3 = torch.rfft(pred_img[2], signal_ndim=2, normalized=False, onesided=False)
+            '''
+
+            #2026/3/11
+            label_fft1 = torch.view_as_real(torch.fft.fft2(label_img4))
+            pred_fft1 = torch.view_as_real(torch.fft.fft2(pred_img[0]))
+            label_fft2 = torch.view_as_real(torch.fft.fft2(label_img2))
+            pred_fft2 = torch.view_as_real(torch.fft.fft2(pred_img[1]))
+            label_fft3 = torch.view_as_real(torch.fft.fft2(label_img))
+            pred_fft3 = torch.view_as_real(torch.fft.fft2(pred_img[2]))
 
             f1 = criterion(pred_fft1, label_fft1)
             f2 = criterion(pred_fft2, label_fft2)
             f3 = criterion(pred_fft3, label_fft3)
+            '''2026/3/11
             loss_fft = f1+f2+f3
 
             loss = loss_content + 0.1 * loss_fft
             loss.backward()
             optimizer.step()
+            '''
+            loss_fft = f1+f2+f3
+            
+            # --- 保留取得小波誤差 ---
+            wvl_loss = model.get_wavelet_loss() 
+            
+            # --- 計算總 Loss (不要再除以 accumulation_steps 了) ---
+            loss = loss_content + 0.1 * loss_fft + 0.1 * wvl_loss 
+            
+            # 直接 Backward 與更新權重
+            loss.backward()
+            optimizer.step()
+            # --------------------------
 
             iter_pixel_adder(loss_content.item())
             iter_fft_adder(loss_fft.item())
 
             epoch_pixel_adder(loss_content.item())
             epoch_fft_adder(loss_fft.item())
+            epoch_wvl_adder(wvl_loss.item())
 
+            '''2026/3/11
             if (iter_idx + 1) % args.print_freq == 0:
                 lr = check_lr(optimizer)
                 print("Time: %7.4f Epoch: %03d Iter: %4d/%4d LR: %.10f Loss content: %7.4f Loss fft: %7.4f" % (
                     iter_timer.toc(), epoch_idx, iter_idx + 1, max_iter, lr, iter_pixel_adder.average(),
                     iter_fft_adder.average()))
+                writer.add_scalar('Pixel Loss', iter_pixel_adder.average(), iter_idx + (epoch_idx-1)* max_iter)
+            '''
+            #2026/3/11
+            if (iter_idx + 1) % args.print_freq == 0:
+                lr = check_lr(optimizer)
+                # 修改 print 加入 Wvl Loss
+                print("Time: %7.4f Epoch: %03d Iter: %4d/%4d LR: %.10f Loss content: %7.4f Loss fft: %7.4f Wvl Loss: %7.4f" % (
+                    iter_timer.toc(), epoch_idx, iter_idx + 1, max_iter, lr, iter_pixel_adder.average(),
+                    iter_fft_adder.average(), wvl_loss.item()))
+                
+                # --- 新增 wandb 記錄 ---
+                wandb.log({
+                    "Train/Loss_content": iter_pixel_adder.average(),
+                    "Train/Loss_fft": iter_fft_adder.average(),
+                    "Train/Loss_wavelet": wvl_loss.item(),
+                    "Train/Learning_Rate": lr,
+                    "Epoch": epoch_idx
+                })
+
                 writer.add_scalar('Pixel Loss', iter_pixel_adder.average(), iter_idx + (epoch_idx-1)* max_iter)
                 writer.add_scalar('FFT Loss', iter_fft_adder.average(), iter_idx + (epoch_idx - 1) * max_iter)
                 iter_timer.tic()
@@ -100,16 +150,58 @@ def _train(model, args):
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
                         'epoch': epoch_idx}, save_name)
-        print("EPOCH: %02d\nElapsed time: %4.2f Epoch Pixel Loss: %7.4f Epoch FFT Loss: %7.4f" % (
-            epoch_idx, epoch_timer.toc(), epoch_pixel_adder.average(), epoch_fft_adder.average()))
+        print("EPOCH: %02d\nElapsed time: %4.2f Epoch Pixel Loss: %7.4f Epoch FFT Loss: %7.4f Epoch Wvl Loss: %7.4f" % (
+            epoch_idx, epoch_timer.toc(), epoch_pixel_adder.average(), epoch_fft_adder.average(), epoch_wvl_adder.average()))
         epoch_fft_adder.reset()
         epoch_pixel_adder.reset()
+        epoch_wvl_adder.reset() # <--- 記得重置！
         scheduler.step()
+
+        '''2026/3/11
         if epoch_idx % args.valid_freq == 0:
             val_gopro = _valid(model, args, epoch_idx)
             print('%03d epoch \n Average GOPRO PSNR %.2f dB' % (epoch_idx, val_gopro))
             writer.add_scalar('PSNR_GOPRO', val_gopro, epoch_idx)
             if val_gopro >= best_psnr:
+        '''
+        '''
+        #2026/3/11
+        if epoch_idx % args.valid_freq == 0:
+            val_gopro = _valid(model, args, epoch_idx)
+            print('%03d epoch \n Average GOPRO PSNR %.2f dB' % (epoch_idx, val_gopro))
+            writer.add_scalar('PSNR_GOPRO', val_gopro, epoch_idx)
+            
+            # --- 新增 wandb 記錄 PSNR ---
+            wandb.log({
+                "Valid/PSNR_GOPRO": val_gopro,
+                "Epoch": epoch_idx
+            })
+            
+            if val_gopro >= best_psnr:
                 torch.save({'model': model.state_dict()}, os.path.join(args.model_save_dir, 'Best.pkl'))
+                best_psnr = val_gopro  # <--- 加上這行！
+        '''
+        #2026/3/12 修改 Validation 區塊
+        if epoch_idx % args.valid_freq == 0:
+            # <--- 接收兩個回傳值
+            val_psnr, val_ssim = _valid(model, args, epoch_idx) 
+            
+            # <--- 修改印出格式，加入 SSIM
+            print('%03d epoch \n Average GOPRO PSNR %.2f dB | SSIM %.4f' % (epoch_idx, val_psnr, val_ssim)) 
+            
+            writer.add_scalar('PSNR_GOPRO', val_psnr, epoch_idx)
+            writer.add_scalar('SSIM_GOPRO', val_ssim, epoch_idx) # <--- 加入 TensorBoard
+            
+            # --- 新增 wandb 記錄 PSNR 與 SSIM ---
+            wandb.log({
+                "Valid/PSNR_GOPRO": val_psnr,
+                "Valid/SSIM_GOPRO": val_ssim, # <--- 加入 W&B
+                "Epoch": epoch_idx
+            })
+            
+            # 依然使用 PSNR 作為覆蓋 Best.pkl 的判斷標準
+            if val_psnr >= best_psnr:
+                torch.save({'model': model.state_dict()}, os.path.join(args.model_save_dir, 'Best.pkl'))
+                best_psnr = val_psnr
     save_name = os.path.join(args.model_save_dir, 'Final.pkl')
     torch.save({'model': model.state_dict()}, save_name)

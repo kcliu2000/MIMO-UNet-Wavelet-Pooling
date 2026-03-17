@@ -1,98 +1,46 @@
+'''
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .layers import *
 
-# 引入 wavelet_pooling 底層的 DWT 與 IWT 核心函式
-from util.conv_transform import conv_fwt_2d, conv_ifwt_2d
+# 加入小波模組的引用 2026/3/11
+from util.wavelet_pool2d import AdaptiveWaveletPool2d
 from util.learnable_wavelets import ProductFilter
 
-# =====================================================================
-# 1. 自定義：真正完美重構的「小波降採樣層 (WaveletDown)」
-# =====================================================================
-class WaveletDown(nn.Module):
-    def __init__(self, in_ch, out_ch, wavelet):
-        super().__init__()
-        self.wavelet = wavelet
-        # DWT 會把 1 個 Channel 拆成 4 個子帶 (LL, LH, HL, HH)
-        # 所以經過小波轉換後，總 Channel 數會變成 in_ch * 4
-        # 我們再用卷積把這些包含所有頻率的特徵融合，輸出我們想要的 out_ch
-        self.conv = BasicConv(in_ch * 4, out_ch, kernel_size=3, stride=1, relu=True)
-        
-    def forward(self, x):
-        B, C, H, W = x.shape
-        # 將 batch 和 channel 壓平，以符合 conv_fwt_2d 的輸入格式 [B*C, 1, H, W]
-        x_fold = x.view(B * C, 1, H, W)
-        
-        # 進行 2D 離散小波轉換
-        coeffs = conv_fwt_2d(x_fold, self.wavelet, scales=1)
-        LL = coeffs[0]            # 低頻子帶
-        LH, HL, HH = coeffs[1]    # 高頻子帶 (垂直、水平、對角邊緣)
-        
-        # 將 4 個子帶在 Channel 維度完美拼接保留: [B*C, 4, H/2, W/2]
-        out = torch.cat([LL, LH, HL, HH], dim=1)
-        # 還原為正常的 Batch 維度: [B, C * 4, H/2, W/2]
-        out = out.view(B, C * 4, LL.shape[-2], LL.shape[-1])
-        
-        # 透過卷積融合 4 個頻率特徵並調整維度
-        return self.conv(out)
-
-# =====================================================================
-# 2. 自定義：真正完美重構的「逆小波上採樣層 (WaveletUp)」
-# =====================================================================
-class WaveletUp(nn.Module):
-    def __init__(self, in_ch, out_ch, wavelet):
-        super().__init__()
-        self.wavelet = wavelet
-        # 為了準備進行逆轉換 (IWT)，我們必須先將輸入特徵擴展為 4 倍
-        # 這樣才能精準分配給 LL, LH, HL, HH 四個子帶
-        self.conv = BasicConv(in_ch, out_ch * 4, kernel_size=3, stride=1, relu=True)
-        
-    def forward(self, x):
-        # 擴展 Channel
-        x = self.conv(x)
-        B, C4, H, W = x.shape
-        out_ch = C4 // 4
-        
-        # 將特徵重新塑形以分配給 4 個子帶: [B * out_ch, 4, H, W]
-        x_fold = x.view(B * out_ch, 4, H, W)
-        
-        # 拆解出 LL, LH, HL, HH (各自維度皆為 [B * out_ch, 1, H, W])
-        LL = x_fold[:, 0:1, :, :]
-        LH = x_fold[:, 1:2, :, :]
-        HL = x_fold[:, 2:3, :, :]
-        HH = x_fold[:, 3:4, :, :]
-        
-        # 打包成 conv_ifwt_2d 需要的格式
-        coeffs = [LL, (LH, HL, HH)]
-        
-        # 進行 2D 逆小波轉換，空間解析度完美無損放大 2 倍
-        out = conv_ifwt_2d(coeffs, self.wavelet)
-        # 還原 Batch 維度: [B, out_ch, 2H, 2W]
-        out = out.view(B, out_ch, out.shape[-2], out.shape[-1])
-        
-        return out
-
-# ================= 原有 MIMO-UNet 基礎 Block =================
+# 建立一個輔助函數來產生適應性小波層 (Scale設為1，代表長寬縮小一半) 2026/3/11
+def get_wavelet_pool():
+    size = 2 # degree 1 (長度為2的濾波器)
+    wavelet = ProductFilter(
+                torch.rand(size, requires_grad=True)*2. - 1.,
+                torch.rand(size, requires_grad=True)*2. - 1.,
+                torch.rand(size, requires_grad=True)*2. - 1.,
+                torch.rand(size, requires_grad=True)*2. - 1.)
+    return AdaptiveWaveletPool2d(wavelet=wavelet, use_scale_weights=False, scales=1)
 
 class EBlock(nn.Module):
     def __init__(self, out_channel, num_res=8):
         super(EBlock, self).__init__()
+
         layers = [ResBlock(out_channel, out_channel) for _ in range(num_res)]
+
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.layers(x)
 
+
 class DBlock(nn.Module):
     def __init__(self, channel, num_res=8):
         super(DBlock, self).__init__()
+
         layers = [ResBlock(channel, channel) for _ in range(num_res)]
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.layers(x)
+
 
 class AFF(nn.Module):
     def __init__(self, in_channel, out_channel):
@@ -106,6 +54,7 @@ class AFF(nn.Module):
         x = torch.cat([x1, x2, x4], dim=1)
         return self.conv(x)
 
+
 class SCM(nn.Module):
     def __init__(self, out_plane):
         super(SCM, self).__init__()
@@ -115,11 +64,13 @@ class SCM(nn.Module):
             BasicConv(out_plane // 2, out_plane // 2, kernel_size=3, stride=1, relu=True),
             BasicConv(out_plane // 2, out_plane-3, kernel_size=1, stride=1, relu=True)
         )
+
         self.conv = BasicConv(out_plane, out_plane, kernel_size=1, stride=1, relu=False)
 
     def forward(self, x):
         x = torch.cat([x, self.main(x)], dim=1)
         return self.conv(x)
+
 
 class FAM(nn.Module):
     def __init__(self, channel):
@@ -131,21 +82,12 @@ class FAM(nn.Module):
         out = x1 + self.merge(x)
         return out
 
-# ================= 完美融合版 主網路架構 =================
 
 class MIMOUNet(nn.Module):
     def __init__(self, num_res=8):
         super(MIMOUNet, self).__init__()
+
         base_channel = 32
-        
-        # 建立一個「全域共享」的可學習小波濾波器
-        # 整個網路不管是 Encoder 還是 Decoder，都共用這組數學權重
-        # 確保 wvl_loss 約束能貫穿整個網路
-        self.wavelet = ProductFilter(
-            torch.rand(2, requires_grad=True)*2. - 1.,
-            torch.rand(2, requires_grad=True)*2. - 1.,
-            torch.rand(2, requires_grad=True)*2. - 1.,
-            torch.rand(2, requires_grad=True)*2. - 1.)
 
         self.Encoder = nn.ModuleList([
             EBlock(base_channel, num_res),
@@ -153,15 +95,32 @@ class MIMOUNet(nn.Module):
             EBlock(base_channel*4, num_res),
         ])
 
-        # 【核心修改區】完全對稱的 小波特徵提取與還原
+        '''2026/3/11
         self.feat_extract = nn.ModuleList([
             BasicConv(3, base_channel, kernel_size=3, relu=True, stride=1),
-            # 取代原本的 stride=2 卷積
-            WaveletDown(base_channel, base_channel*2, self.wavelet),      
-            WaveletDown(base_channel*2, base_channel*4, self.wavelet),    
-            # 取代原本的 transpose=True 反卷積
-            WaveletUp(base_channel*4, base_channel*2, self.wavelet),      
-            WaveletUp(base_channel*2, base_channel, self.wavelet),        
+            BasicConv(base_channel, base_channel*2, kernel_size=3, relu=True, stride=2),
+            BasicConv(base_channel*2, base_channel*4, kernel_size=3, relu=True, stride=2),
+            BasicConv(base_channel*4, base_channel*2, kernel_size=4, relu=True, stride=2, transpose=True),
+            BasicConv(base_channel*2, base_channel, kernel_size=4, relu=True, stride=2, transpose=True),
+            BasicConv(base_channel, 3, kernel_size=3, relu=False, stride=1)
+        ])
+        '''
+
+        #2026/3/11
+        self.feat_extract = nn.ModuleList([
+            BasicConv(3, base_channel, kernel_size=3, relu=True, stride=1),
+            # 替換第 1 次下採樣
+            nn.Sequential(
+                get_wavelet_pool(),
+                BasicConv(base_channel, base_channel*2, kernel_size=3, relu=True, stride=1)
+            ),
+            # 替換第 2 次下採樣
+            nn.Sequential(
+                get_wavelet_pool(),
+                BasicConv(base_channel*2, base_channel*4, kernel_size=3, relu=True, stride=1)
+            ),
+            BasicConv(base_channel*4, base_channel*2, kernel_size=4, relu=True, stride=2, transpose=True),
+            BasicConv(base_channel*2, base_channel, kernel_size=4, relu=True, stride=2, transpose=True),
             BasicConv(base_channel, 3, kernel_size=3, relu=False, stride=1)
         ])
 
@@ -176,10 +135,12 @@ class MIMOUNet(nn.Module):
             BasicConv(base_channel * 2, base_channel, kernel_size=1, relu=True, stride=1),
         ])
 
-        self.ConvsOut = nn.ModuleList([
-            BasicConv(base_channel * 4, 3, kernel_size=3, relu=False, stride=1),
-            BasicConv(base_channel * 2, 3, kernel_size=3, relu=False, stride=1),
-        ])
+        self.ConvsOut = nn.ModuleList(
+            [
+                BasicConv(base_channel * 4, 3, kernel_size=3, relu=False, stride=1),
+                BasicConv(base_channel * 2, 3, kernel_size=3, relu=False, stride=1),
+            ]
+        )
 
         self.AFFs = nn.ModuleList([
             AFF(base_channel * 7, base_channel*1),
@@ -237,19 +198,85 @@ class MIMOUNet(nn.Module):
         outputs.append(z+x)
 
         return outputs
-
+    
+    #2026/3/11
     def get_wavelet_loss(self):
-        # 由於我們只實例化了一個共用的 wavelet，直接回傳它的 loss 即可
-        return self.wavelet.wavelet_loss()
+        # self.feat_extract[1][0] 就是我們剛剛塞進去的第一個小波層
+        loss1 = self.feat_extract[1][0].get_wavelet_loss()
+        loss2 = self.feat_extract[2][0].get_wavelet_loss()
+        return loss1 + loss2
 
 
-class MIMOUNetPlus(MIMOUNet):
-    def __init__(self, num_res=20):
-        # 繼承 MIMOUNet 的完美小波結構，僅改變 Residual block 的數量
-        super(MIMOUNetPlus, self).__init__(num_res=num_res)
+class MIMOUNetPlus(nn.Module):
+    def __init__(self, num_res = 20):
+        super(MIMOUNetPlus, self).__init__()
+        base_channel = 32
+        self.Encoder = nn.ModuleList([
+            EBlock(base_channel, num_res),
+            EBlock(base_channel*2, num_res),
+            EBlock(base_channel*4, num_res),
+        ])
+
+        '''2026/3/11
+        self.feat_extract = nn.ModuleList([
+            BasicConv(3, base_channel, kernel_size=3, relu=True, stride=1),
+            BasicConv(base_channel, base_channel*2, kernel_size=3, relu=True, stride=2),
+            BasicConv(base_channel*2, base_channel*4, kernel_size=3, relu=True, stride=2),
+            BasicConv(base_channel*4, base_channel*2, kernel_size=4, relu=True, stride=2, transpose=True),
+            BasicConv(base_channel*2, base_channel, kernel_size=4, relu=True, stride=2, transpose=True),
+            BasicConv(base_channel, 3, kernel_size=3, relu=False, stride=1)
+        ])
+        '''
+
+        #2026/3/11
+        self.feat_extract = nn.ModuleList([
+            BasicConv(3, base_channel, kernel_size=3, relu=True, stride=1),
+            # 替換第 1 次下採樣
+            nn.Sequential(
+                get_wavelet_pool(),
+                BasicConv(base_channel, base_channel*2, kernel_size=3, relu=True, stride=1)
+            ),
+            # 替換第 2 次下採樣
+            nn.Sequential(
+                get_wavelet_pool(),
+                BasicConv(base_channel*2, base_channel*4, kernel_size=3, relu=True, stride=1)
+            ),
+            BasicConv(base_channel*4, base_channel*2, kernel_size=4, relu=True, stride=2, transpose=True),
+            BasicConv(base_channel*2, base_channel, kernel_size=4, relu=True, stride=2, transpose=True),
+            BasicConv(base_channel, 3, kernel_size=3, relu=False, stride=1)
+        ])
+
+        self.Decoder = nn.ModuleList([
+            DBlock(base_channel * 4, num_res),
+            DBlock(base_channel * 2, num_res),
+            DBlock(base_channel, num_res)
+        ])
+
+        self.Convs = nn.ModuleList([
+            BasicConv(base_channel * 4, base_channel * 2, kernel_size=1, relu=True, stride=1),
+            BasicConv(base_channel * 2, base_channel, kernel_size=1, relu=True, stride=1),
+        ])
+
+        self.ConvsOut = nn.ModuleList(
+            [
+                BasicConv(base_channel * 4, 3, kernel_size=3, relu=False, stride=1),
+                BasicConv(base_channel * 2, 3, kernel_size=3, relu=False, stride=1),
+            ]
+        )
+
+        self.AFFs = nn.ModuleList([
+            AFF(base_channel * 7, base_channel*1),
+            AFF(base_channel * 7, base_channel*2)
+        ])
+
+        self.FAM1 = FAM(base_channel * 4)
+        self.SCM1 = SCM(base_channel * 4)
+        self.FAM2 = FAM(base_channel * 2)
+        self.SCM2 = SCM(base_channel * 2)
+
         self.drop1 = nn.Dropout2d(0.1)
         self.drop2 = nn.Dropout2d(0.1)
-        
+
     def forward(self, x):
         x_2 = F.interpolate(x, scale_factor=0.5)
         x_4 = F.interpolate(x_2, scale_factor=0.5)
@@ -277,7 +304,6 @@ class MIMOUNetPlus(MIMOUNet):
         res2 = self.AFFs[1](z12, res2, z42)
         res1 = self.AFFs[0](res1, z21, z41)
 
-        # Plus 版本專屬的 Dropout
         res2 = self.drop2(res2)
         res1 = self.drop1(res1)
 
@@ -301,11 +327,19 @@ class MIMOUNetPlus(MIMOUNet):
 
         return outputs
 
+    #2026/3/11
+    def get_wavelet_loss(self):
+        # self.feat_extract[1][0] 就是我們剛剛塞進去的第一個小波層
+        loss1 = self.feat_extract[1][0].get_wavelet_loss()
+        loss2 = self.feat_extract[2][0].get_wavelet_loss()
+        return loss1 + loss2
+
 
 def build_net(model_name):
     class ModelError(Exception):
         def __init__(self, msg):
             self.msg = msg
+
         def __str__(self):
             return self.msg
 
@@ -314,3 +348,4 @@ def build_net(model_name):
     elif model_name == "MIMO-UNet":
         return MIMOUNet()
     raise ModelError('Wrong Model!\nYou should choose MIMO-UNetPlus or MIMO-UNet.')
+    '''
